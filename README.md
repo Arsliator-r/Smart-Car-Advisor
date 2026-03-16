@@ -97,7 +97,11 @@ GEMINI_API_KEY=your_gemini_api_key_here
 ```
 Get your free API key at [Google AI Studio](https://aistudio.google.com)
 
-### 4. Run the App
+### 4. Train Models
+Model files (.pkl) are not included due to size. 
+Run notebooks 1 → 2 → 3 → 4 in order to regenerate them.
+
+### 5. Run the App
 ```bash
 streamlit run app.py
 ```
@@ -115,6 +119,7 @@ Smart-Car-Advisor/
 │   ├── price_model_optimized.pkl   ← Trained Random Forest model
 │   ├── inspector_model.pkl         ← Inspection scoring model
 │   └── tfidf_vectorizer.pkl        ← TF-IDF vectorizer
+> ⚠️ Model files (.pkl) are not included due to size. Run notebooks 1 → 2 → 3 → 4 in order to regenerate them.
 │
 ├── notebooks/
 │   ├── 1_train_inspector.ipynb
@@ -174,6 +179,7 @@ User Input (Structured + Text Description)
 ```
 
 ---
+
 
 ## 🔒 Security Note
 

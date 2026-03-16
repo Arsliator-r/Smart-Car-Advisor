@@ -24,3 +24,5 @@ Thumbs.db
 
 # Large data files (uncomment if CSVs exceed 100MB)
 # data/
+
+*.pkl
