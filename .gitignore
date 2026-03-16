@@ -1,0 +1,26 @@
+# Virtual environment
+Scripts/
+Lib/
+Include/
+pydeck.json
+
+# Environment variables — API keys go here, never upload this
+.env
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code settings
+.vscode/
+
+# Large data files (uncomment if CSVs exceed 100MB)
+# data/
