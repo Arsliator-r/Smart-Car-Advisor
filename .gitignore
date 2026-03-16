@@ -3,6 +3,7 @@ Scripts/
 Lib/
 Include/
 pydeck.json
+pyvenv.cfg
 
 # Environment variables — API keys go here, never upload this
 .env
