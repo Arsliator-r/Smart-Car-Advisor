@@ -4,7 +4,7 @@ import joblib
 import re
 import time
 import json
-import google.generativeai as genai
+from openai import OpenAI
 from dotenv import load_dotenv
 import base64
 import os
@@ -18,14 +18,21 @@ st.set_page_config(
 )
 
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-try:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    gemini_model = genai.GenerativeModel("models/gemini-2.5-flash-lite")
-    chat_available = True
-except Exception:
+if OPENROUTER_API_KEY:
+    try:
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+        )
+        chat_available = True
+    except Exception as e:
+        chat_available = False
+        client = None
+else:
     chat_available = False
+    client = None
 
 # ─── GLOBAL CSS ─────────────────────────────────────────────────
 st.markdown("""
@@ -441,59 +448,428 @@ def get_ai_recommendations(car_title, user_desc):
         return []
     try:
         prompt = f"""
-        Act as a Pakistani Used Car Dealer Expert.
+        Act as a Pakistani Used Car Dealer Expert. 
         I am selling a: {car_title}
         Current Condition/Description: "{user_desc}"
-
-        Identify 3 specific, high-return physical upgrades or fixes that would maximize
-        the resale value of this SPECIFIC car in the Pakistani market.
-
+        DETECTED ISSUES: {', '.join(tags)}
+        
+        Identify 3 specific, high-return physical upgrades 
+        or fixes that would maximize the resale value of 
+        this SPECIFIC car in the Pakistani market.
+        
         Rules:
-        1. Do NOT suggest things already mentioned in the description.
-        2. Be specific (e.g. "Android Panel" not "Sound system").
-        3. For each item, give a "Lift Score" (1-10).
-        4. Return ONLY a valid JSON list:
+        1. Do NOT suggest things already mentioned 
+           in the description.
+        2. Be specific (e.g., instead of "Sound system", 
+           say "Android Panel").
+        3. For each item, give a "Lift Score" (1-10) of 
+           how much it helps the price.
+        4. Return ONLY a valid JSON list like this:
         [
-          {{"mod": "Android Panel", "reason": "High demand in family cars", "lift": 9}},
-          {{"mod": "Detailing/Compound", "reason": "Removes scratches", "lift": 7}}
+          {{"mod": "Android Panel", 
+            "reason": "High demand in Family cars", 
+            "lift": 9}},
+          {{"mod": "Detailing/Compound", 
+            "reason": "Removes scratches", 
+            "lift": 7}}
         ]
+        5. If TAG_FILE_ISSUE is present, focus suggestions on legal resolution, not cosmetic upgrades.
         """
-        response = gemini_model.generate_content(prompt)
-        text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
-    except Exception:
+
+        response = client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a Pakistani used car market expert. Always respond with valid JSON only. No markdown, no explanation."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=500,
+        )
+
+        text = response.choices[0].message.content
+        text = text.replace("```json", "").replace("```", "").strip()
+        recommendations = json.loads(text)
+        return recommendations
+
+    except Exception as e:
         return [
-            {"mod": "Detailing & Polishing", "reason": "Universal value booster", "lift": 5},
-            {"mod": "High-Quality Pictures", "reason": "Increases click-through rate", "lift": 8},
+            {"mod": "Detailing & Polishing", 
+             "reason": "Universal value booster", 
+             "lift": 5},
+            {"mod": "High-Quality Pictures", 
+             "reason": "Increases click-through rate", 
+             "lift": 8}
         ]
 
 
-# ─── NLP TAGGER ──────────────────────────────────────────────────
+# ── Negation helper ──────────────────────────────────────────────
+def _negated(text, match_start, window=30):
+    prefix = text[max(0, match_start - window): match_start]
+    return bool(re.search(
+        r"\b(no|not|never|without|zero|none|dont|don't|nahi|nahin|bilkul)\b",
+        prefix
+    ))
+
+# ── Count touching pieces ────────────────────────────────────────
+def _count_touching_pieces(text):
+    """
+    Extracts the number of pieces mentioned in touching/touch context.
+    Returns integer count or None if not found.
+    """
+    word_to_num = {
+        "one":1,"two":2,"three":3,"four":4,"five":5,
+        "six":6,"seven":7,"eight":8,"nine":9,"ten":10,
+        "ek":1,"do":2,"teen":3,"char":4,"panch":5
+    }
+    # Pattern: "4 piece touch" or "four pieces" or "4-5 piece"
+    patterns = [
+        r"\b(\d+)\s*(?:to|-|or)\s*(\d+)\s*(?:piece|pc|pcs|panel|touch)",
+        r"\b(\d+)\s*(?:piece|pc|pcs|panel|touch)",
+        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|ek|do|teen|char|panch)"
+          r"\s*(?:to|-|or)?\s*(?:one|two|three|four|five|six|seven|eight|nine|ten)?"
+          r"\s*(?:piece|pc|pcs|panel|touch)",
+    ]
+    # Range pattern — take the higher number (worst case)
+    m = re.search(
+        r"\b(\d+)\s*(?:to|-|or)\s*(\d+)\s*(?:piece|pc|pcs|panel|touch)", text
+    )
+    if m:
+        return max(int(m.group(1)), int(m.group(2)))
+
+    # Single number
+    m = re.search(r"\b(\d+)\s*(?:piece|pc|pcs|panel|touch)", text)
+    if m:
+        return int(m.group(1))
+
+    # Word number
+    for word, num in word_to_num.items():
+        if re.search(rf"\b{word}\s*(?:piece|pc|pcs|panel|touch)", text):
+            return num
+
+    return None
+
+
 def smart_condition_tagger(text):
     if not isinstance(text, str):
         return ""
-    text = text.lower()
-    tags = []
-    if re.search(r"(file).*(miss|lost|dup|fake)", text) or "ncp" in text:
-        tags.append("TAG_FILE_ISSUE")
-    elif re.search(r"(book|card|copy).*(dup|miss|fake)", text):
-        tags.append("TAG_BOOK_ISSUE")
-    if re.search(r"(roof|pillar|front|back|side).*(paint|damage|shower|accident)", text):
-        tags.append("TAG_MAJOR_ACCIDENT")
-    if re.search(r"(engine|gear).*(change|swap|replace|noise|smoke)", text):
-        tags.append("TAG_MECHANICAL_BAD")
-    if "shower" in text or "repaint" in text or "fresh look" in text:
-        tags.append("TAG_COSMETIC_BAD")
-    minor_pattern = r"\b(1|one|2|two|3|three)(\s+(or|to|-)\s+(2|two|3|three))?\s*(piece|pc|touch)"
-    if re.search(minor_pattern, text) or "minor" in text:
-        tags.append("TAG_MINOR")
-    bad_tags = ["TAG_FILE_ISSUE","TAG_BOOK_ISSUE","TAG_MAJOR_ACCIDENT",
-                "TAG_MECHANICAL_BAD","TAG_COSMETIC_BAD","TAG_MINOR"]
-    if not any(t in tags for t in bad_tags):
-        if any(w in text for w in ["genuine","bumper","no touch","original"]):
-            tags.append("TAG_EXCELLENT")
-    return text + " " + " ".join(list(set(tags)))
 
+    original_lower = text.lower()
+    text = original_lower
+    tags  = set()
+    # severity_notes will store extra context for the penalty engine
+    notes = {}
+
+    # ── TIER 1: CATASTROPHIC FILE ISSUES ────────────────────────
+    tier1_patterns = [
+        r"(file|files)\s*(is\s*)?(miss|lost|dup|fake|stolen|incomplete)",
+        r"(missing|duplicate|fake|stolen)\s*(file|ownership)",
+        r"\bncp\b",
+        r"non[\s-]?custom[\s-]?paid",
+        r"open\s*letter",
+        r"(registration|reg)\s*(stolen|fake|tampered)",
+    ]
+    for p in tier1_patterns:
+        m = re.search(p, text)
+        if m and not _negated(text, m.start()):
+            tags.add("TAG_FILE_ISSUE")
+            break
+
+    # ── TIER 2: LEGAL / ADMINISTRATIVE ──────────────────────────
+    # Duplicate book
+    book_patterns = [
+        r"(book|logbook|log[\s-]?book)\s*(dup|duplicate|miss|fake|lost)",
+        r"(smart\s*card|card)\s*(dup|duplicate|miss|fake|lost)",
+        r"duplicate\s*(book|card|smart)",
+    ]
+    for p in book_patterns:
+        m = re.search(p, text)
+        if m and not _negated(text, m.start()):
+            tags.add("TAG_BOOK_ISSUE")
+            break
+
+    # Token unpaid — SEPARATE from file issue, lower penalty
+    token_patterns = [
+        r"token\s*(unpaid|due|pending|not\s*paid|nahi\s*diya)",
+        r"(tax|taxes)\s*(unpaid|due|pending|overdue)",
+    ]
+    for p in token_patterns:
+        m = re.search(p, text)
+        if m and not _negated(text, m.start()):
+            tags.add("TAG_TOKEN_UNPAID")
+            break
+
+    # Court case / on money (on money = registration/tax discrepancy)
+    legal_misc = [
+        r"court\s*(case|matter|challan)",
+        r"\bon[\s-]?money\b",           # on-money = underpaid tax
+        r"(registration|reg)\s*(issue|problem|mismatch|city\s*mismatch)",
+    ]
+    for p in legal_misc:
+        m = re.search(p, text)
+        if m and not _negated(text, m.start()):
+            tags.add("TAG_LEGAL_MISC")
+            break
+
+    # ── TIER 3: STRUCTURAL DAMAGE ───────────────────────────────
+    structural_patterns = [
+        r"(roof|pillar[s]?|a[\s-]?pillar|b[\s-]?pillar|c[\s-]?pillar)"
+          r"\s*(paint|painted|damage|shower|dent|bent|replaced|accidental)",
+        r"(chassis|frame)\s*(damage|bent|twisted|straightened|repaired)",
+        r"total\s*(loss|damage)",
+        r"flood[\s-]?(affected|damage|hit)",
+        r"fire[\s-]?(damage|affected)",
+        r"(major|heavy|severe|serious)\s*(accident|accidental|hit|crash)",
+        r"complete\s*(shower|repaint|paint\s*job)\s*(roof|pillar|top)",
+        r"(bonnet|boot)\s*(replaced|new|changed)",   # bonnet replaced = front impact
+    ]
+    for p in structural_patterns:
+        m = re.search(p, text)
+        if m and not _negated(text, m.start()):
+            tags.add("TAG_MAJOR_ACCIDENT")
+            break
+
+    # ── TIER 4: MECHANICAL ──────────────────────────────────────
+    mech_patterns = [
+        (r"(engine|motor)\s*(change|changed|swap|swapped|replace|replaced|overhaul)",
+         "engine_replaced"),
+        (r"(lifan|chinese|local|3rd[\s-]?party)\s*(engine|motor)",
+         "engine_replaced"),
+        (r"(engine|motor)\s*(noise|knock|smoke|leak|issue|problem|burning)",
+         "engine_issue"),
+        (r"(gearbox|gear\s*box|transmission)\s*(change|issue|noise|problem|slip|gone)",
+         "gearbox"),
+        (r"over\s*heat(ing)?",                  "overheating"),
+        (r"white\s*smoke",                       "engine_issue"),
+        (r"oil\s*(leak|burning)",                "engine_issue"),
+        (r"(timing\s*chain|timing\s*belt)\s*(issue|problem|noise|done|changed)",
+         "engine_issue"),
+        (r"(ac|air\s*con(dition)?)\s*(not\s*working|faulty|dead|gone|issue)",
+         "ac_issue"),
+    ]
+    for p, note in mech_patterns:
+        m = re.search(p, text)
+        if m and not _negated(text, m.start()):
+            tags.add("TAG_MECHANICAL_BAD")
+            notes["mechanical"] = note
+            break
+
+    # ── TIER 5 & 6: COSMETIC — THE NUANCED PART ─────────────────
+    # Only evaluate cosmetic if no structural damage already
+    if "TAG_MAJOR_ACCIDENT" not in tags:
+
+        # Full shower / complete repaint (worst cosmetic)
+        full_shower_patterns = [
+            r"\bshower(ed|ing)?\b",
+            r"full\s*(body\s*)?(paint|painted|respray|repaint)",
+            r"complete\s*(repaint|paint\s*job|colour\s*change)",
+            r"colour\s*change",
+            r"\brepaint(ed|ing)?\b",
+            r"fresh\s*(look|paint|color|colour)",
+        ]
+        is_full_shower = False
+        for p in full_shower_patterns:
+            m = re.search(p, text)
+            if m and not _negated(text, m.start()):
+                is_full_shower = True
+                break
+
+        # Sides spray (medium cosmetic — 4-6 panels)
+        sides_spray_patterns = [
+            r"sides?\s*(spray|painted|repaint|done|shower)",
+            r"(left|right|both)\s*side[s]?\s*(spray|paint|done)",
+            r"panel\s*(beat|beaten|beater)",
+            r"dent[s]?\s*(on|at|near)?\s*(door|fender|quarter|side)",
+        ]
+        is_sides_spray = False
+        for p in sides_spray_patterns:
+            m = re.search(p, text)
+            if m and not _negated(text, m.start()):
+                is_sides_spray = True
+                break
+
+        # Count pieces for numeric touch mentions
+        piece_count = _count_touching_pieces(text)
+
+        # Now determine the correct cosmetic tier
+        if is_full_shower:
+            tags.add("TAG_COSMETIC_FULL")      # −10%
+        elif is_sides_spray:
+            tags.add("TAG_COSMETIC_MED")        # −8%
+        elif piece_count is not None:
+            notes["piece_count"] = piece_count
+            if piece_count >= 6:
+                tags.add("TAG_COSMETIC_MED")    # −8% (6+ pieces ≈ sides spray)
+            elif piece_count >= 4:
+                tags.add("TAG_MINOR_HEAVY")     # −4% (4-5 pieces)
+            elif piece_count >= 1:
+                tags.add("TAG_MINOR_LIGHT")     # −2% (1-3 pieces)
+        else:
+            # Text-based minor indicators (no piece count)
+            minor_text_patterns = [
+                r"\bminor\s*(touch|scratch|dent|work|repair)\b",
+                r"\bsmall\s*(touch|scratch|dent)\b",
+                r"\b(light|slight)\s*(scratch|dent|touch)\b",
+                r"\btouchup\b",
+                r"\btouch[\s-]?up\b",
+                r"\bminor\b",
+            ]
+            for p in minor_text_patterns:
+                m = re.search(p, text)
+                if m and not _negated(text, m.start()):
+                    tags.add("TAG_MINOR_LIGHT")  # −2% default for vague minor
+                    break
+
+    # ── OWNERSHIP CHAIN ──────────────────────────────────────────
+    ownership_m = re.search(
+        r"\b(\d+)(st|nd|rd|th)\s*owner\b"
+        r"|\b(fourth|fifth|sixth|seventh|4th|5th|6th|7th)\s*owner\b",
+        text
+    )
+    if ownership_m:
+        raw = ownership_m.group(0)
+        num_m = re.search(r"\d+", raw)
+        word_map = {"fourth":4,"fifth":5,"sixth":6,"seventh":7}
+        count = int(num_m.group()) if num_m else next(
+            (v for k,v in word_map.items() if k in raw), None
+        )
+        if count and count >= 4 and not _negated(text, ownership_m.start()):
+            tags.add("TAG_HIGH_OWNERSHIP")
+            notes["owners"] = count
+
+    # ── EXCELLENT / GENUINE ──────────────────────────────────────
+    negative_tags = {
+        "TAG_FILE_ISSUE","TAG_BOOK_ISSUE","TAG_TOKEN_UNPAID",
+        "TAG_LEGAL_MISC","TAG_MAJOR_ACCIDENT","TAG_MECHANICAL_BAD",
+        "TAG_COSMETIC_FULL","TAG_COSMETIC_MED","TAG_MINOR_HEAVY",
+        "TAG_MINOR_LIGHT","TAG_HIGH_OWNERSHIP"
+    }
+    if not tags.intersection(negative_tags):
+        excellent_patterns = [
+            r"total\s*genuine",
+            r"bumper\s*(to|-)\s*bumper\s*(genuine|original)",
+            r"\bsealed\b",
+            r"\bno\s*(touch|paint|accident|damage|work)\b",
+            r"never\s*(touch|paint|accident)",
+            r"mint\s*(condition)?",
+            r"showroom\s*(condition|fresh)",
+            r"zero\s*(touch|accident|work)",
+        ]
+        for p in excellent_patterns:
+            if re.search(p, text):
+                tags.add("TAG_EXCELLENT")
+                break
+
+        if "TAG_EXCELLENT" not in tags:
+            if re.search(r"\bgenuine\b|\boriginal\b", text):
+                tags.add("TAG_GENUINE")
+
+    tag_str = " ".join(sorted(tags))
+    return original_lower + " " + tag_str, tags, notes
+
+def apply_penalty(tagged_desc, tags, notes, final_score):
+    """
+    Returns (penalty_multiplier, status_msg, badge_class, final_score)
+    Priority: higher severity tags override lower ones.
+    """
+    penalty = 1.0
+    status_msg = "Standard Market Condition"
+    badge_class = "badge-fair"
+
+    # Tier 1 — Catastrophic
+    if "TAG_FILE_ISSUE" in tags:
+        penalty = 0.65
+        status_msg = "⚠️ Missing / Duplicate File"
+        final_score = min(final_score, 5.0)
+        badge_class = "badge-poor"
+
+    elif "TAG_MAJOR_ACCIDENT" in tags:
+        penalty = 0.75
+        status_msg = "❌ Structural Accident Detected"
+        final_score = min(final_score, 6.0)
+        badge_class = "badge-poor"    
+
+    # Tier 2 — Major Legal
+    elif "TAG_BOOK_ISSUE" in tags:
+        penalty = 0.88
+        status_msg = "⚠️ Duplicate Book / Smart Card"
+        final_score = min(final_score, 7.0)
+        badge_class = "badge-fair"
+
+    elif "TAG_MECHANICAL_BAD" in tags:
+        mech = notes.get("mechanical", "")
+        if mech == "engine_replaced":
+            penalty = 0.82
+            status_msg = "🔧 Engine Replaced / Swapped"
+        else:
+            penalty = 0.90
+            status_msg = "🔧 Mechanical Issue Detected"
+        final_score = min(final_score, 7.0)
+        badge_class = "badge-fair"
+
+    # Tier 3 — Cosmetic (graduated)
+    elif "TAG_COSMETIC_FULL" in tags:
+        penalty = 0.90
+        status_msg = "🎨 Full Shower / Complete Repaint"
+        final_score = min(final_score, 7.5)
+        badge_class = "badge-fair"
+
+    elif "TAG_COSMETIC_MED" in tags:
+        pieces = notes.get("piece_count", "")
+        piece_str = f" ({pieces} Pieces)" if pieces else " (Sides Spray)"
+        penalty = 0.92
+        status_msg = f"🎨 Medium Cosmetic Work{piece_str}"
+        final_score = min(final_score, 8.0)
+        badge_class = "badge-fair"
+
+    elif "TAG_MINOR_HEAVY" in tags:
+        pieces = notes.get("piece_count", "4-5")
+        penalty = 0.96
+        status_msg = f"🖌️ {pieces} Piece Touchup"
+        badge_class = "badge-good"
+
+    elif "TAG_MINOR_LIGHT" in tags:
+        pieces = notes.get("piece_count", "1-2")
+        penalty = 0.98
+        status_msg = f"🖌️ Minor Touch ({pieces} Piece)"
+        badge_class = "badge-good"
+
+    # Tier 4 — Administrative
+    elif "TAG_TOKEN_UNPAID" in tags:
+        penalty = 0.95
+        status_msg = "📋 Token / Tax Unpaid"
+        final_score = min(final_score, 8.5)
+        badge_class = "badge-fair"
+
+    elif "TAG_LEGAL_MISC" in tags:
+        penalty = 0.93
+        status_msg = "📋 Minor Legal Issue (On-Money / City Mismatch)"
+        badge_class = "badge-fair"
+
+    elif "TAG_HIGH_OWNERSHIP" in tags:
+        owners = notes.get("owners", "4th+")
+        penalty = 0.95
+        status_msg = f"👥 High Ownership Chain ({owners} Owner)"
+        final_score = min(final_score, 8.0)
+        badge_class = "badge-fair"
+
+    # Tier 5 — Positive
+    elif "TAG_EXCELLENT" in tags:
+        penalty = 1.05
+        status_msg = "💎 Bumper-to-Bumper Genuine"
+        badge_class = "badge-excellent"
+
+    elif "TAG_GENUINE" in tags:
+        penalty = 1.02
+        status_msg = "✅ Genuine Condition"
+        badge_class = "badge-good"
+
+    return penalty, status_msg, badge_class, final_score
 
 # ─── NAV STATE ───────────────────────────────────────────────────
 if "active_tab" not in st.session_state:
@@ -606,7 +982,7 @@ if st.session_state.active_tab == "estimator":
         fuel  = st.selectbox("Fuel Type", ["Petrol", "Diesel", "Hybrid"])
 
     # Row 2: Year slider
-    year = st.slider("Model Year", 2005, 2024, 2020)
+    year = st.slider("Model Year", 1985, 2025, 2020)
 
     # Row 3: Mileage + Engine
     r3c1, r3c2 = st.columns(2)
@@ -636,55 +1012,23 @@ if st.session_state.active_tab == "estimator":
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ── CTA ──
-    calc_clicked = st.button("Calculate Market Value 🚀", type="primary", use_container_width=True)
+    calc_clicked = st.button("Calculate Market Value", type="primary", use_container_width=True)
 
     # ── Results ──
     if calc_clicked:
         with st.spinner("AI is analyzing your car…"):
-            time.sleep(0.6)   # small dramatic pause
+            time.sleep(0.6)   # small pause
 
             # 1. Tag
-            tagged_desc = smart_condition_tagger(user_desc)
-
+            tagged_desc, tags, notes = smart_condition_tagger(user_desc)
+            
             # 2. Inspector model → condition score
             X_text = vectorizer.transform([tagged_desc])
             predicted_score = inspector_model.predict(X_text)[0]
             final_score = round(predicted_score, 1)
 
             # 3. Rule engine
-            legal_structural_penalty = 1.0
-            status_msg  = "Standard Market Condition"
-            badge_class = "badge-fair"
-
-            if "TAG_FILE_ISSUE" in tagged_desc:
-                status_msg = "⚠️ Missing / Duplicate File"
-                legal_structural_penalty = 0.65
-                final_score = min(final_score, 5.0)
-                badge_class = "badge-poor"
-            elif "TAG_BOOK_ISSUE" in tagged_desc:
-                status_msg = "⚠️ Duplicate Book / Card"
-                legal_structural_penalty = 0.88
-                final_score = min(final_score, 7.0)
-                badge_class = "badge-fair"
-            elif "TAG_MAJOR_ACCIDENT" in tagged_desc:
-                status_msg = "❌ Structural Accident"
-                legal_structural_penalty = 0.75
-                final_score = min(final_score, 6.0)
-                badge_class = "badge-poor"
-            elif "TAG_MECHANICAL_BAD" in tagged_desc:
-                status_msg = "🔧 Major Mechanical Fault"
-                legal_structural_penalty = 0.85
-                final_score = min(final_score, 7.0)
-                badge_class = "badge-fair"
-            elif "TAG_COSMETIC_BAD" in tagged_desc:
-                status_msg = "🎨 Repainted / Showered"
-                badge_class = "badge-fair"
-            elif "TAG_MINOR" in tagged_desc:
-                status_msg = "🖌️ Minor Touchups"
-                badge_class = "badge-good"
-            elif "TAG_EXCELLENT" in tagged_desc:
-                status_msg = "💎 Bumper-to-Bumper Genuine"
-                badge_class = "badge-excellent"
+            legal_structural_penalty, status_msg, badge_class, final_score = apply_penalty(tagged_desc, tags, notes, final_score)
 
             # 4. Price model
             input_data = pd.DataFrame({
@@ -787,12 +1131,13 @@ if st.session_state.active_tab == "estimator":
                     </div>
                     """, unsafe_allow_html=True)
         else:
+            # Fallback upgrade card
             st.markdown("""
             <div class="upgrade-card">
-              <div class="upgrade-info">
-                <h4>Connect Gemini API</h4>
-                <p>Add GEMINI_API_KEY to .env to unlock personalized upgrade suggestions</p>
-              </div>
+            <div class="upgrade-info">
+                <h4>Connect OpenRouter API</h4>
+                <p>Add OPENROUTER_API_KEY to .env to unlock personalized upgrade suggestions</p>
+            </div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -806,10 +1151,11 @@ elif st.session_state.active_tab == "chat":
 
     st.markdown('<div class="page-wrapper">', unsafe_allow_html=True)
 
+    # Chat hero
     st.markdown("""
     <div class="chat-hero">
-      <h1>AI Mechanic</h1>
-      <p>Powered by Gemini 2.5 Flash · Context-aware · Pakistani market specialist</p>
+    <h1>AI Mechanic</h1>
+    <p>Powered by GPT-4o Mini · Context-aware · Pakistani market specialist</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -854,12 +1200,13 @@ elif st.session_state.active_tab == "chat":
     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 
     if not chat_available:
+        # Fallback upgrade card
         st.markdown("""
         <div class="upgrade-card">
-          <div class="upgrade-info">
-            <h4>⚠️ Gemini API Key Not Found</h4>
-            <p>Add GEMINI_API_KEY to your .env file to enable the AI Mechanic chat.</p>
-          </div>
+        <div class="upgrade-info">
+            <h4>Connect OpenRouter API</h4>
+            <p>Add OPENROUTER_API_KEY to .env to unlock personalized upgrade suggestions</p>
+        </div>
         </div>
         """, unsafe_allow_html=True)
     else:
@@ -899,23 +1246,34 @@ elif st.session_state.active_tab == "chat":
                         role_label = "User" if msg["role"] == "user" else "AI"
                         history_text += f"{role_label}: {msg['content']}\n"
 
-                    final_prompt = f"""
-SYSTEM INSTRUCTION:
-You are an expert car mechanic and market analyst for the Pakistani Used Car Market.
-1. Keep answers concise (200-250 words max).
-2. Use bullet points for lists.
-3. Use Pakistani currency (Lakhs, Crores) and local terminology
-   (Touching, Genuine, Shahnawaz Import, On-money, NCP).
-4. Use conversation history for context.
-
-CONVERSATION HISTORY:
-{history_text}
-
-NEW QUESTION:
-{user_prompt}
-"""
-                    response = gemini_model.generate_content(final_prompt)
-                    ai_text  = response.text
+                    response = client.chat.completions.create(
+                        model="openai/gpt-4o-mini",
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are an expert car mechanic and market "
+                                    "analyst for the Pakistani Used Car Market.\n"
+                                    "1. Keep answers concise (200-250 words max).\n"
+                                    "2. Use bullet points for lists.\n"
+                                    "3. Use Pakistani currency (Lakhs, Crores) "
+                                    "and local terminology (Touching, Genuine, "
+                                    "Shahnawaz Import, On-money, NCP).\n"
+                                    "4. Use conversation history for context."
+                                )
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"CONVERSATION HISTORY:\n{history_text}"
+                                    f"\n\nNEW QUESTION:\n{user_prompt}"
+                                )
+                            }
+                        ],
+                        temperature=0.7,
+                        max_tokens=400,
+                    )
+                    ai_text = response.choices[0].message.content
 
                     for chunk in ai_text.split():
                         full_response += chunk + " "
